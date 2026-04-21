@@ -65,6 +65,10 @@ parser.add_argument('--beta', default=1.0, type=float, help='DERPP beta paramete
 parser.add_argument('--k_shot', default=1, type=int, help='k-shot finetuning for PALL')
 parser.add_argument('--forget_iters', default=None, type=int, help='forgetting iterations for ER methods')
 parser.add_argument('--deterministic', default=False, action='store_true', help='enable deterministic runs')
+# PALL modified-unlearning knobs (all defaults are explicit and serialized in config.json):
+# - Protection selection: protect_ratio takes precedence over protect_threshold when both are provided.
+# - Retrain-step resolution: retrain_epochs (alias) > retrain_steps > k_shot.
+# - If adaptive_retrain is enabled, resolved steps are scaled by overlap ratio.
 parser.add_argument('--protect_ratio', default=None, type=float, help='fraction of shared params to protect')
 parser.add_argument('--protect_threshold', default=None, type=float, help='abs weight threshold for protection')
 parser.add_argument('--lambda_protect', default=0.0, type=float, help='regularization weight for protected params')
@@ -262,6 +266,145 @@ def acc_list_to_dict(acc_list):
     return {str(idx): float(acc) for idx, acc in enumerate(acc_list)}
 
 
+def to_optional_float(value):
+    if value is None:
+        return None
+    return float(value)
+
+
+def to_optional_int(value):
+    if value is None:
+        return None
+    return int(value)
+
+
+def format_optional_float(value, precision=4):
+    if value is None:
+        return "NA"
+    return f"{float(value):.{precision}f}"
+
+
+def format_optional_int(value):
+    if value is None:
+        return "NA"
+    return str(int(value))
+
+
+def format_optional_text(value):
+    if value is None:
+        return "NA"
+    if isinstance(value, str) and value == "":
+        return "NA"
+    return str(value)
+
+
+def first_non_none(*values):
+    for value in values:
+        if value is not None:
+            return value
+    return None
+
+
+def compute_average_forgetting(accuracy_history, requests, n_tasks):
+    """
+    Standard CL forgetting at step r for task t:
+      F_t(r) = max_{k<r} a_t(k) - a_t(r)
+    where a_t(k) is task-t accuracy at request k.
+
+    We average over tasks that have been trained at least once and have at least
+    one past accuracy point before the current request.
+    """
+    if torch.is_tensor(accuracy_history):
+        acc_history = accuracy_history.detach().cpu().tolist()
+    else:
+        acc_history = to_list(accuracy_history)
+
+    if not acc_history:
+        return {
+            "definition": "avg_t(max_{k<r} a_t(k) - a_t(r)) over trained tasks with at least one past point",
+            "per_request": [],
+            "per_task": [],
+            "final": 0.0,
+        }
+
+    best_past = [None] * n_tasks
+    trained_tasks = set()
+    per_request = []
+    per_task = []
+
+    for request_id, (task_id, learn_type, _) in enumerate(requests):
+        curr_acc = acc_history[request_id]
+        if learn_type == "T":
+            trained_tasks.add(int(task_id))
+
+        task_forgetting = {}
+        forgetting_vals = []
+        for task_id in sorted(trained_tasks):
+            best = best_past[task_id]
+            curr = float(curr_acc[task_id])
+            if best is not None:
+                f_val = float(best - curr)
+                task_forgetting[str(task_id)] = f_val
+                forgetting_vals.append(f_val)
+
+        per_task.append(task_forgetting)
+        per_request.append(float(sum(forgetting_vals) / len(forgetting_vals)) if forgetting_vals else 0.0)
+
+        for task_id in trained_tasks:
+            curr = float(curr_acc[task_id])
+            best = best_past[task_id]
+            if best is None or curr > best:
+                best_past[task_id] = curr
+
+    final_forgetting = float(per_request[-1]) if per_request else 0.0
+    return {
+        "definition": "avg_t(max_{k<r} a_t(k) - a_t(r)) over trained tasks with at least one past point",
+        "per_request": per_request,
+        "per_task": per_task,
+        "final": final_forgetting,
+    }
+
+
+def normalize_unlearning_event(event, availability=None):
+    availability = availability or {}
+    overlap = event.get("overlap", {}) or {}
+
+    t_reset = to_optional_float(event.get("t_reset")) if availability.get("t_reset", True) else None
+    t_retrain = to_optional_float(event.get("t_retrain")) if availability.get("t_retrain", True) else None
+    t_forget_total = to_optional_float(event.get("t_forget_total"))
+    if t_forget_total is None and (t_reset is not None or t_retrain is not None):
+        t_forget_total = (t_reset or 0.0) + (t_retrain or 0.0)
+
+    return {
+        "unlearning_step": to_optional_int(event.get("unlearning_step")),
+        "request_id": to_optional_int(event.get("request_id")),
+        "task_id": to_optional_int(event.get("task_id")),
+        "Fu": to_optional_float(event.get("Fu")),
+        "WorstDrop": to_optional_float(event.get("WorstDrop")),
+        "Au": to_optional_float(event.get("Au")),
+        "avg_before": to_optional_float(event.get("avg_before")),
+        "avg_after_reset": to_optional_float(event.get("avg_after_reset")),
+        "avg_after_retrain": to_optional_float(event.get("avg_after_retrain")),
+        "t_reset": t_reset,
+        "t_retrain": t_retrain,
+        "t_forget_total": t_forget_total,
+        "num_updated_params": (
+            to_optional_int(event.get("num_updated_params")) if availability.get("num_updated_params", True) else None
+        ),
+        "overlap": {
+            "s_t": to_optional_int(overlap.get("s_t")) if availability.get("overlap", True) else None,
+            "s_share": to_optional_int(overlap.get("s_share")) if availability.get("overlap", True) else None,
+            "s_share_crit": to_optional_int(overlap.get("s_share_crit")) if availability.get("overlap", True) else None,
+            "s_share_ratio": (
+                to_optional_float(overlap.get("s_share_ratio")) if availability.get("overlap", True) else None
+            ),
+            "s_share_crit_ratio": (
+                to_optional_float(overlap.get("s_share_crit_ratio")) if availability.get("overlap", True) else None
+            ),
+        },
+    }
+
+
 def process_requests(args, model, train_datasets, test_datasets, requests, run_context):
     forgotten_tasks = []
     loss = torch.zeros(len(requests), args.n_tasks)
@@ -318,9 +461,10 @@ def process_requests(args, model, train_datasets, test_datasets, requests, run_c
                 model.privacy_aware_lifelong_learning(task_id, train_datasets[task_id], learn_type)
                 t1 = time.perf_counter()
                 info = {
-                    "t_reset": t1 - t0,
-                    "t_retrain": 0.0,
-                    "num_updated_params": 0,
+                    "t_reset": None,
+                    "t_retrain": None,
+                    "t_forget_total": t1 - t0,
+                    "num_updated_params": None,
                 }
 
             after_reset_eval = info.get("after_reset_eval")
@@ -352,43 +496,68 @@ def process_requests(args, model, train_datasets, test_datasets, requests, run_c
                 "Fu": fu,
                 "WorstDrop": worst_drop,
                 "Au": au,
-                "t_reset": info.get("t_reset", 0.0),
-                "t_retrain": info.get("t_retrain", 0.0),
-                "num_updated_params": info.get("num_updated_params", 0),
+                "t_reset": info.get("t_reset", 0.0) if info.get("t_reset") is not None else 0.0,
+                "t_retrain": info.get("t_retrain", 0.0) if info.get("t_retrain") is not None else 0.0,
+                "t_forget_total": info.get("t_forget_total"),
+                "num_updated_params": (
+                    info.get("num_updated_params")
+                    if info.get("num_updated_params") is not None
+                    else 0
+                ),
                 "overlap": {
-                    "s_t": info.get("s_t", 0),
-                    "s_share": info.get("s_share", 0),
-                    "s_share_crit": info.get("s_share_crit", 0),
-                    "s_share_ratio": info.get("s_share_ratio", 0.0),
-                    "s_share_crit_ratio": info.get("s_share_crit_ratio", 0.0),
+                    "s_t": info.get("s_t", 0) if info.get("s_t") is not None else 0,
+                    "s_share": info.get("s_share", 0) if info.get("s_share") is not None else 0,
+                    "s_share_crit": info.get("s_share_crit", 0) if info.get("s_share_crit") is not None else 0,
+                    "s_share_ratio": (
+                        info.get("s_share_ratio", 0.0) if info.get("s_share_ratio") is not None else 0.0
+                    ),
+                    "s_share_crit_ratio": (
+                        info.get("s_share_crit_ratio", 0.0) if info.get("s_share_crit_ratio") is not None else 0.0
+                    ),
                 },
                 "protection": info.get("protection", {}),
                 "finetune_diag": finetune_diag,
             }
-            log_event(
-                logger,
-                "[INFO] overlap: |S_t|={s_t} |S_share|={s_share} |S_share_crit|={s_share_crit} "
-                "ratios: share={share_ratio:.4f} crit={crit_ratio:.4f}".format(
-                    s_t=info.get("s_t", 0),
-                    s_share=info.get("s_share", 0),
-                    s_share_crit=info.get("s_share_crit", 0),
-                    share_ratio=info.get("s_share_ratio", 0.0),
-                    crit_ratio=info.get("s_share_crit_ratio", 0.0),
-                ),
+            normalized_event = normalize_unlearning_event(
+                event,
+                availability={
+                    "t_reset": info.get("t_reset") is not None,
+                    "t_retrain": info.get("t_retrain") is not None,
+                    "num_updated_params": info.get("num_updated_params") is not None,
+                    "overlap": any(
+                        key in info
+                        for key in ("s_t", "s_share", "s_share_crit", "s_share_ratio", "s_share_crit_ratio")
+                    ),
+                },
             )
             log_event(
                 logger,
-                "[INFO] unlearning timing: t_reset={t_reset:.4f}s t_retrain={t_retrain:.4f}s "
-                "updated_params={updated}".format(
-                    t_reset=info.get("t_reset", 0.0),
-                    t_retrain=info.get("t_retrain", 0.0),
-                    updated=info.get("num_updated_params", 0),
-                ),
+                "[INFO] overlap: |S_t|={s_t} |S_share|={s_share} |S_share_crit|={s_share_crit} "
+                "ratios: share={share_ratio} crit={crit_ratio}".format(
+                    s_t=format_optional_int(normalized_event["overlap"].get("s_t")),
+                    s_share=format_optional_int(normalized_event["overlap"].get("s_share")),
+                    s_share_crit=format_optional_int(normalized_event["overlap"].get("s_share_crit")),
+                    share_ratio=format_optional_float(normalized_event["overlap"].get("s_share_ratio")),
+                    crit_ratio=format_optional_float(normalized_event["overlap"].get("s_share_crit_ratio")),
+                )
+            )
+            log_event(
+                logger,
+                "[INFO] unlearning timing: t_reset={t_reset}s t_retrain={t_retrain}s "
+                "t_forget_total={t_total}s updated_params={updated}".format(
+                    t_reset=format_optional_float(normalized_event.get("t_reset")),
+                    t_retrain=format_optional_float(normalized_event.get("t_retrain")),
+                    t_total=format_optional_float(normalized_event.get("t_forget_total")),
+                    updated=format_optional_int(normalized_event.get("num_updated_params")),
+                )
             )
             if finetune_diag is not None:
                 log_event(logger, f"[INFO] finetune_diag: {json.dumps(finetune_diag)}")
             if metrics_state is not None:
                 metrics_state.setdefault("unlearning_events", []).append(event)
+                metrics_state.setdefault("normalized_results", {}).setdefault("unlearning_events", []).append(
+                    normalized_event
+                )
                 write_json(metrics_path, metrics_state)
 
             chance_acc = 1.0 / args.class_per_task
@@ -402,8 +571,8 @@ def process_requests(args, model, train_datasets, test_datasets, requests, run_c
                 sanity_msgs.append(
                     f"[WARN] Unlearned task {task_id} accuracy above chance: {au:.4f} (chance {chance_acc:.4f})"
                 )
-            share_ratio = info.get("s_share_ratio", 1.0)
-            if args.method_variant == "modified" and share_ratio < 0.05:
+            share_ratio = info.get("s_share_ratio")
+            if args.method_variant == "modified" and share_ratio is not None and share_ratio < 0.05:
                 sanity_msgs.append(
                     f"[INFO] Overlap ratio is low ({share_ratio:.4f}); modified method should be close to baseline."
                 )
@@ -414,7 +583,12 @@ def process_requests(args, model, train_datasets, test_datasets, requests, run_c
                 log_event(logger, msg)
 
             unlearning_step += 1
-            times[request_id] = info.get("t_reset", 0.0) + info.get("t_retrain", 0.0)
+            t_reset = info.get("t_reset")
+            t_retrain = info.get("t_retrain")
+            t_forget_total = info.get("t_forget_total")
+            if t_forget_total is None:
+                t_forget_total = (t_reset or 0.0) + (t_retrain or 0.0)
+            times[request_id] = float(t_forget_total)
         else:
             t0 = time.perf_counter()
             model.privacy_aware_lifelong_learning(task_id, train_datasets[task_id], learn_type)
@@ -452,7 +626,12 @@ def write_overlap_csv(path, task_ids, matrix):
             writer.writerow([str(task_id)] + [f"{val:.6f}" for val in row])
 
 
-def write_summary(path, summary, unlearning_events):
+def write_summary(path, summary, normalized_results):
+    normalized_results = normalized_results or {}
+    final_block = normalized_results.get("final", {})
+    final_unlearning = final_block.get("final_unlearning", {})
+    final_overlap = final_unlearning.get("overlap", {}) if isinstance(final_unlearning, dict) else {}
+
     lines = [
         f"run_dir: {summary['run_dir']}",
         f"dataset: {summary['dataset']}",
@@ -460,35 +639,240 @@ def write_summary(path, summary, unlearning_events):
         f"seed: {summary['seed']} (deterministic={summary['deterministic']})",
         f"tasks: {summary['n_tasks']} | forget_requests: {summary['n_forget']}",
         f"final_avg_accuracy: {summary['final_avg_accuracy']:.4f}",
+        f"final_avg_forgetting: {summary['final_avg_forgetting']:.4f}",
+        (
+            "final_unlearning: Fu {fu} WorstDrop {worst_drop} Au {au} "
+            "t_reset {t_reset}s t_retrain {t_retrain}s t_forget_total {t_total}s "
+            "updated_params {updated} share_ratio {share_ratio} crit_ratio {crit_ratio}".format(
+                fu=format_optional_float(final_unlearning.get("Fu")),
+                worst_drop=format_optional_float(final_unlearning.get("WorstDrop")),
+                au=format_optional_float(final_unlearning.get("Au")),
+                t_reset=format_optional_float(final_unlearning.get("t_reset")),
+                t_retrain=format_optional_float(final_unlearning.get("t_retrain")),
+                t_total=format_optional_float(final_unlearning.get("t_forget_total")),
+                updated=format_optional_int(final_unlearning.get("num_updated_params")),
+                share_ratio=format_optional_float(final_overlap.get("s_share_ratio")),
+                crit_ratio=format_optional_float(final_overlap.get("s_share_crit_ratio")),
+            )
+        ),
         "",
-        "unlearning_events:",
+        "normalized_unlearning_events:",
     ]
+    unlearning_events = normalized_results.get("unlearning_events", [])
     if not unlearning_events:
         lines.append("none")
     for event in unlearning_events:
         overlap = event.get("overlap", {})
         lines.append(
-            "step {step} task {task} avg_before {avg_before:.4f} "
-            "avg_after_reset {avg_after_reset:.4f} avg_after_retrain {avg_after_retrain:.4f} "
-            "Fu {fu:.4f} WorstDrop {worst_drop:.4f} Au {au:.4f} "
-            "t_reset {t_reset:.2f}s t_retrain {t_retrain:.2f}s "
-            "share_ratio {share_ratio:.4f} crit_ratio {crit_ratio:.4f}".format(
-                step=event.get("unlearning_step"),
-                task=event.get("task_id"),
-                avg_before=event.get("avg_before", 0.0),
-                avg_after_reset=event.get("avg_after_reset", 0.0),
-                avg_after_retrain=event.get("avg_after_retrain", 0.0),
-                fu=event.get("Fu", 0.0),
-                worst_drop=event.get("WorstDrop", 0.0),
-                au=event.get("Au", 0.0),
-                t_reset=event.get("t_reset", 0.0),
-                t_retrain=event.get("t_retrain", 0.0),
-                share_ratio=overlap.get("s_share_ratio", 0.0),
-                crit_ratio=overlap.get("s_share_crit_ratio", 0.0),
-            )
+            "step {step} task {task} avg_before {avg_before} "
+            "avg_after_reset {avg_after_reset} avg_after_retrain {avg_after_retrain} "
+            "Fu {fu} WorstDrop {worst_drop} Au {au} "
+            "t_reset {t_reset}s t_retrain {t_retrain}s t_forget_total {t_total}s "
+            "updated_params {updated} share_ratio {share_ratio} crit_ratio {crit_ratio}".format(
+                step=format_optional_int(event.get("unlearning_step")),
+                task=format_optional_int(event.get("task_id")),
+                avg_before=format_optional_float(event.get("avg_before")),
+                avg_after_reset=format_optional_float(event.get("avg_after_reset")),
+                avg_after_retrain=format_optional_float(event.get("avg_after_retrain")),
+                fu=format_optional_float(event.get("Fu")),
+                worst_drop=format_optional_float(event.get("WorstDrop")),
+                au=format_optional_float(event.get("Au")),
+                t_reset=format_optional_float(event.get("t_reset")),
+                t_retrain=format_optional_float(event.get("t_retrain")),
+                t_total=format_optional_float(event.get("t_forget_total")),
+                updated=format_optional_int(event.get("num_updated_params")),
+                share_ratio=format_optional_float(overlap.get("s_share_ratio")),
+                crit_ratio=format_optional_float(overlap.get("s_share_crit_ratio")),
+            ),
         )
     with open(path, "w", encoding="utf-8") as handle:
         handle.write("\n".join(lines))
+
+
+def summarize_overlap_csv(path):
+    if not path.exists():
+        return None
+    with open(path, "r", encoding="utf-8", newline="") as handle:
+        reader = csv.reader(handle)
+        rows = list(reader)
+    if len(rows) < 2 or len(rows[0]) < 2:
+        return None
+
+    n = len(rows[0]) - 1
+    matrix = []
+    for row in rows[1:]:
+        if len(row) < n + 1:
+            return None
+        parsed = []
+        for cell in row[1:n + 1]:
+            try:
+                parsed.append(float(cell))
+            except ValueError:
+                return None
+        matrix.append(parsed)
+    if len(matrix) != n:
+        return None
+
+    diag_vals = []
+    offdiag_vals = []
+    all_vals = []
+    for i in range(n):
+        for j in range(n):
+            val = matrix[i][j]
+            all_vals.append(val)
+            if i == j:
+                diag_vals.append(val)
+            else:
+                offdiag_vals.append(val)
+
+    def mean_or_none(values):
+        if not values:
+            return None
+        return float(sum(values) / len(values))
+
+    return {
+        "n_tasks_in_overlap": n,
+        "num_task_pairs": (n * (n - 1)) // 2,
+        "avg_overlap_offdiag": mean_or_none(offdiag_vals),
+        "max_overlap_offdiag": max(offdiag_vals) if offdiag_vals else None,
+        "min_overlap_offdiag": min(offdiag_vals) if offdiag_vals else None,
+        "avg_overlap_all": mean_or_none(all_vals),
+        "diag_mean": mean_or_none(diag_vals),
+    }
+
+
+def write_run_report(path, run_dir, config, metrics_state):
+    normalized_results = metrics_state.get("normalized_results", {})
+    normalized_final = normalized_results.get("final", {}) if isinstance(normalized_results, dict) else {}
+    summary = metrics_state.get("summary", {})
+    forgetting = metrics_state.get("forgetting", {})
+
+    final_avg_acc = first_non_none(
+        normalized_final.get("final_avg_accuracy"),
+        summary.get("final_avg_accuracy"),
+    )
+    avg_forgetting = first_non_none(
+        normalized_final.get("average_forgetting"),
+        forgetting.get("final") if isinstance(forgetting, dict) else None,
+        summary.get("final_avg_forgetting"),
+    )
+
+    final_unlearning = normalized_final.get("final_unlearning", {})
+    if not isinstance(final_unlearning, dict) or not final_unlearning:
+        events = metrics_state.get("unlearning_events", [])
+        if isinstance(events, list) and events:
+            last = events[-1] if isinstance(events[-1], dict) else {}
+        else:
+            last = {}
+        overlap = last.get("overlap", {}) if isinstance(last.get("overlap"), dict) else {}
+        final_unlearning = {
+            "Fu": last.get("Fu"),
+            "WorstDrop": last.get("WorstDrop"),
+            "Au": last.get("Au"),
+            "t_reset": last.get("t_reset"),
+            "t_retrain": last.get("t_retrain"),
+            "t_forget_total": first_non_none(
+                last.get("t_forget_total"),
+                (last.get("t_reset", 0.0) + last.get("t_retrain", 0.0)) if (last.get("t_reset") is not None or last.get("t_retrain") is not None) else None,
+            ),
+            "num_updated_params": last.get("num_updated_params"),
+            "overlap": {
+                "s_t": overlap.get("s_t"),
+                "s_share": overlap.get("s_share"),
+                "s_share_crit": overlap.get("s_share_crit"),
+                "s_share_ratio": overlap.get("s_share_ratio"),
+                "s_share_crit_ratio": overlap.get("s_share_crit_ratio"),
+            },
+        }
+
+    overlap_block = final_unlearning.get("overlap", {}) if isinstance(final_unlearning, dict) else {}
+    overlap_csv_path = run_dir / "overlap.csv"
+    overlap_csv_summary = summarize_overlap_csv(overlap_csv_path)
+
+    config_rows = [
+        ("dataset", config.get("dataset")),
+        ("method", config.get("method")),
+        ("method_variant", config.get("method_variant")),
+        ("seed", config.get("seed")),
+        ("arch", config.get("arch")),
+        ("class_per_task", config.get("class_per_task")),
+        ("n_tasks", config.get("n_tasks")),
+        ("n_forget", config.get("n_forget")),
+        ("n_epochs", config.get("n_epochs")),
+        ("batch_size", config.get("batch_size")),
+        ("optim", config.get("optim")),
+        ("lr", config.get("lr")),
+        ("deterministic", config.get("deterministic")),
+    ]
+
+    lines = [
+        "# Run Report",
+        "",
+        "## Config Summary",
+        "| Key | Value |",
+        "| --- | --- |",
+    ]
+    for key, value in config_rows:
+        lines.append(f"| {key} | {format_optional_text(value)} |")
+
+    lines.extend(
+        [
+            "",
+            "## Final Metrics",
+            "| Metric | Value |",
+            "| --- | --- |",
+            f"| final_avg_accuracy | {format_optional_float(final_avg_acc)} |",
+            f"| average_forgetting | {format_optional_float(avg_forgetting)} |",
+            f"| num_unlearning_events | {format_optional_int(normalized_final.get('num_unlearning_events'))} |",
+            "",
+            "## Unlearning Metrics",
+            "| Metric | Value |",
+            "| --- | --- |",
+            f"| Fu | {format_optional_float(final_unlearning.get('Fu'))} |",
+            f"| WorstDrop | {format_optional_float(final_unlearning.get('WorstDrop'))} |",
+            f"| Au | {format_optional_float(final_unlearning.get('Au'))} |",
+            f"| t_reset | {format_optional_float(final_unlearning.get('t_reset'))} |",
+            f"| t_retrain | {format_optional_float(final_unlearning.get('t_retrain'))} |",
+            f"| t_forget_total | {format_optional_float(final_unlearning.get('t_forget_total'))} |",
+            f"| num_updated_params | {format_optional_int(final_unlearning.get('num_updated_params'))} |",
+            f"| s_share_ratio | {format_optional_float(overlap_block.get('s_share_ratio'))} |",
+            f"| s_share_crit_ratio | {format_optional_float(overlap_block.get('s_share_crit_ratio'))} |",
+        ]
+    )
+
+    lines.extend(
+        [
+            "",
+            "## Overlap CSV Summary",
+            "| Metric | Value |",
+            "| --- | --- |",
+        ]
+    )
+    if overlap_csv_summary is None:
+        lines.append("| overlap_csv | NA |")
+    else:
+        lines.append(f"| n_tasks_in_overlap | {format_optional_int(overlap_csv_summary.get('n_tasks_in_overlap'))} |")
+        lines.append(f"| num_task_pairs | {format_optional_int(overlap_csv_summary.get('num_task_pairs'))} |")
+        lines.append(f"| avg_overlap_offdiag | {format_optional_float(overlap_csv_summary.get('avg_overlap_offdiag'))} |")
+        lines.append(f"| max_overlap_offdiag | {format_optional_float(overlap_csv_summary.get('max_overlap_offdiag'))} |")
+        lines.append(f"| min_overlap_offdiag | {format_optional_float(overlap_csv_summary.get('min_overlap_offdiag'))} |")
+        lines.append(f"| avg_overlap_all | {format_optional_float(overlap_csv_summary.get('avg_overlap_all'))} |")
+        lines.append(f"| diag_mean | {format_optional_float(overlap_csv_summary.get('diag_mean'))} |")
+
+    artifact_files = [
+        "config.json",
+        "metrics.json",
+        "results.pth",
+        "summary.txt",
+        "overlap.csv",
+    ]
+    lines.extend(["", "## Artifacts", "| File | Location |", "| --- | --- |"])
+    for name in artifact_files:
+        artifact_path = run_dir / name
+        lines.append(f"| {name} | {artifact_path if artifact_path.exists() else 'NA'} |")
+
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write("\n".join(lines) + "\n")
 
 
 def generate_user_requests(num_tasks, sequence_length):
@@ -616,6 +1000,14 @@ def main():
         "sanity_checks": [],
         "requests": user_requests_with_active_tasks,
         "requests_without_forgotten": user_requests_without_forgotten,
+        "normalized_results": {
+            "schema_version": "v1",
+            "definition": {
+                "average_forgetting": "avg_t(max_{k<r} a_t(k) - a_t(r)) over trained tasks with at least one past point"
+            },
+            "final": {},
+            "unlearning_events": [],
+        },
     }
     metrics_path = run_dir / "metrics.json"
     write_json(metrics_path, metrics_state)
@@ -644,6 +1036,12 @@ def main():
         user_requests_with_active_tasks,
         run_context,
     )
+    forgetting_stats = compute_average_forgetting(
+        current_stat["accuracy"],
+        user_requests_with_active_tasks,
+        args.n_tasks,
+    )
+    current_stat["avg_forgetting"] = torch.tensor(forgetting_stats["per_request"], dtype=torch.float32)
 
     if not metrics_state.get("unlearning_events"):
         msg = (
@@ -686,10 +1084,55 @@ def main():
         "n_tasks": args.n_tasks,
         "n_forget": args.n_forget,
         "final_avg_accuracy": final_avg,
+        "final_avg_forgetting": forgetting_stats["final"],
     }
+    normalized_results = metrics_state.get("normalized_results", {})
+    normalized_events = normalized_results.get("unlearning_events", [])
+    final_unlearning = {
+        "Fu": None,
+        "WorstDrop": None,
+        "Au": None,
+        "t_reset": None,
+        "t_retrain": None,
+        "t_forget_total": None,
+        "num_updated_params": None,
+        "overlap": {
+            "s_t": None,
+            "s_share": None,
+            "s_share_crit": None,
+            "s_share_ratio": None,
+            "s_share_crit_ratio": None,
+        },
+    }
+    if normalized_events:
+        last_event = normalized_events[-1]
+        final_unlearning = {
+            "Fu": last_event.get("Fu"),
+            "WorstDrop": last_event.get("WorstDrop"),
+            "Au": last_event.get("Au"),
+            "t_reset": last_event.get("t_reset"),
+            "t_retrain": last_event.get("t_retrain"),
+            "t_forget_total": last_event.get("t_forget_total"),
+            "num_updated_params": last_event.get("num_updated_params"),
+            "overlap": last_event.get("overlap", final_unlearning["overlap"]),
+        }
+    normalized_results["final"] = {
+        "final_avg_accuracy": final_avg,
+        "average_forgetting": forgetting_stats["final"],
+        "final_avg_forgetting": forgetting_stats["final"],
+        "num_unlearning_events": len(normalized_events),
+        "final_unlearning": final_unlearning,
+    }
+    metrics_state["normalized_results"] = normalized_results
+    metrics_state["forgetting"] = forgetting_stats
     metrics_state["summary"] = summary
     write_json(metrics_path, metrics_state)
-    write_summary(run_dir / "summary.txt", summary, metrics_state.get("unlearning_events", []))
+    write_summary(run_dir / "summary.txt", summary, metrics_state.get("normalized_results"))
+    try:
+        write_run_report(run_dir / "report.md", run_dir, config, metrics_state)
+        log_event(logger, f"[INFO] wrote run report to {run_dir / 'report.md'}")
+    except Exception as exc:
+        log_event(logger, f"[WARN] failed to write run report: {exc}")
 
 
 if __name__ == "__main__":
