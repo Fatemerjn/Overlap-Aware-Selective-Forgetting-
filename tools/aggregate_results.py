@@ -34,6 +34,7 @@ from typing import Any, Dict, Iterable, List, Optional
 
 COLUMNS: List[str] = [
     "run_path",
+    "experiment_tag",
     "dataset",
     "method",
     "seed",
@@ -143,6 +144,7 @@ def extract_row(run_dir: Path, config: Dict[str, Any], metrics: Dict[str, Any]) 
 
     return {
         "run_path": str(run_dir),
+        "experiment_tag": first_non_none(config.get("experiment_tag"), nested_get(metrics, "run", "experiment_tag")),
         "dataset": first_non_none(config.get("dataset"), nested_get(metrics, "run", "dataset")),
         "method": first_non_none(config.get("method"), nested_get(metrics, "run", "method")),
         "seed": first_non_none(config.get("seed"), nested_get(metrics, "run", "seed")),
@@ -176,7 +178,26 @@ def extract_row(run_dir: Path, config: Dict[str, Any], metrics: Dict[str, Any]) 
     }
 
 
-def aggregate_runs(root: Path) -> List[Dict[str, Any]]:
+def value_matches_filter(value: Any, accepted_values: Optional[List[str]]) -> bool:
+    if not accepted_values:
+        return True
+    if value is None:
+        return False
+    return str(value) in {str(item) for item in accepted_values}
+
+
+def row_matches_filters(row: Dict[str, Any], args: argparse.Namespace) -> bool:
+    return (
+        value_matches_filter(row.get("dataset"), args.dataset)
+        and value_matches_filter(row.get("method"), args.method)
+        and value_matches_filter(row.get("n_tasks"), args.n_tasks)
+        and value_matches_filter(row.get("n_forget"), args.n_forget)
+        and value_matches_filter(row.get("seed"), args.seed)
+        and value_matches_filter(row.get("experiment_tag"), args.experiment_tag)
+    )
+
+
+def aggregate_runs(root: Path, args: argparse.Namespace) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     for run_dir in sorted(find_run_dirs(root)):
         config = load_json(run_dir / "config.json")
@@ -184,7 +205,9 @@ def aggregate_runs(root: Path) -> List[Dict[str, Any]]:
             print(f"[WARN] Skipping run without valid config.json: {run_dir}", file=sys.stderr)
             continue
         metrics = load_json(run_dir / "metrics.json") or {}
-        rows.append(extract_row(run_dir, config, metrics))
+        row = extract_row(run_dir, config, metrics)
+        if row_matches_filters(row, args):
+            rows.append(row)
     return rows
 
 
@@ -201,6 +224,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Aggregate experiment runs into one CSV summary.")
     parser.add_argument("--root", type=Path, default=Path("runs"), help="Root directory to scan recursively.")
     parser.add_argument("--out", type=Path, default=Path("results_summary.csv"), help="Output CSV file path.")
+    parser.add_argument("--dataset", nargs="+", default=None, help="Filter by dataset value(s).")
+    parser.add_argument("--method", nargs="+", default=None, help="Filter by method value(s).")
+    parser.add_argument("--n-tasks", dest="n_tasks", nargs="+", default=None, help="Filter by n_tasks value(s).")
+    parser.add_argument("--n-forget", dest="n_forget", nargs="+", default=None, help="Filter by n_forget value(s).")
+    parser.add_argument("--seed", nargs="+", default=None, help="Filter by seed value(s).")
+    parser.add_argument("--experiment-tag", nargs="+", default=None, help="Filter by experiment_tag value(s).")
     return parser.parse_args()
 
 
@@ -214,7 +243,7 @@ def main() -> int:
         print(f"[ERROR] Root path is not a directory: {root}", file=sys.stderr)
         return 1
 
-    rows = aggregate_runs(root)
+    rows = aggregate_runs(root, args)
     write_csv(rows, args.out)
     print(f"[INFO] Aggregated {len(rows)} runs into: {args.out}")
     return 0

@@ -24,6 +24,7 @@ parser.add_argument('--n_tasks', default=5, type=int, help='number of tasks in C
 parser.add_argument('--n_forget', default=3, type=int, help='number of forget requests by the user to simulate')
 parser.add_argument('--request_schedule_file', default=None, type=str,
                     help='optional JSON file with fixed request schedule')
+parser.add_argument('--experiment_tag', default=None, type=str, help='optional tag for grouping experiment runs')
 parser.add_argument('--arch', default='resnet18', type=str, help='neural network architecture')
 parser.add_argument('--norm_params', default=False, action='store_true', help='use batch-norm params in dense models')
 parser.add_argument('--seed', default=0, type=int, help='seed')
@@ -1163,6 +1164,7 @@ def main():
             "dataset": args.dataset,
             "method": args.method,
             "method_variant": args.method_variant,
+            "experiment_tag": args.experiment_tag,
             "seed": args.seed,
             "deterministic": args.deterministic,
             "n_tasks": args.n_tasks,
