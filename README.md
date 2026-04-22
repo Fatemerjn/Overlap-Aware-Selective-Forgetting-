@@ -38,8 +38,8 @@ Notes:
 
 Current `cifar100` constraint in code:
 - `--class_per_task` must be `5`.
-- `--n_tasks` must be `<= 20`.
-- Tasks use CIFAR-100 superclass grouping in the current implementation.
+- `--n_tasks` must be in `[1, 20]`.
+- Tasks use the fixed CIFAR-100 superclass grouping in the current implementation; each task contains one superclass with 5 original classes.
 
 ## Forgetting Setting (Important)
 
@@ -58,6 +58,19 @@ python -u main.py --dataset cifar10 --class_per_task 2 --n_tasks 5 --n_forget 3 
 One CIFAR-10 modified run (`pall_modified`):
 ```bash
 python -u main.py --dataset cifar10 --class_per_task 2 --n_tasks 5 --n_forget 3 \
+  --arch resnet18 --method pall_modified --seed 0 --deterministic \
+  --protect_ratio 0.2 --lambda_protect 0.1 --retrain_steps 50 --dump_overlap
+```
+
+One CIFAR-100 baseline run (`pall_original`):
+```bash
+python -u main.py --dataset cifar100 --class_per_task 5 --n_tasks 10 --n_forget 3 \
+  --arch resnet18 --method pall_original --seed 0 --deterministic
+```
+
+One CIFAR-100 modified run (`pall_modified`):
+```bash
+python -u main.py --dataset cifar100 --class_per_task 5 --n_tasks 10 --n_forget 3 \
   --arch resnet18 --method pall_modified --seed 0 --deterministic \
   --protect_ratio 0.2 --lambda_protect 0.1 --retrain_steps 50 --dump_overlap
 ```

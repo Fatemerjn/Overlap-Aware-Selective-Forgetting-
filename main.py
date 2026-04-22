@@ -97,6 +97,14 @@ def normalize_method(arg_namespace):
         arg_namespace.method_variant = None
 
 
+def validate_experiment_args(arg_namespace):
+    if arg_namespace.dataset == "cifar100":
+        if arg_namespace.class_per_task != 5:
+            parser.error("CIFAR-100 superclass tasks require --class_per_task 5.")
+        if not (1 <= arg_namespace.n_tasks <= 20):
+            parser.error("CIFAR-100 superclass tasks require --n_tasks in [1, 20].")
+
+
 def set_seed(seed, deterministic=False):
     random.seed(seed)
     os.environ["PYTHONHASHSEED"] = str(seed)
@@ -178,6 +186,7 @@ def serialize_config(arg_namespace, run_dir, timestamp):
 
 
 normalize_method(args)
+validate_experiment_args(args)
 
 
 def resolve_device(arg_namespace):
