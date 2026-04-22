@@ -22,6 +22,8 @@ parser.add_argument('--dataset', default='cifar10', choices=['cifar10', 'cifar10
 parser.add_argument('--class_per_task', default=2, type=int, help='number of classes per task in CL')
 parser.add_argument('--n_tasks', default=5, type=int, help='number of tasks in CL')
 parser.add_argument('--n_forget', default=3, type=int, help='number of forget requests by the user to simulate')
+parser.add_argument('--request_schedule_file', default=None, type=str,
+                    help='optional JSON file with fixed request schedule')
 parser.add_argument('--arch', default='resnet18', type=str, help='neural network architecture')
 parser.add_argument('--norm_params', default=False, action='store_true', help='use batch-norm params in dense models')
 parser.add_argument('--seed', default=0, type=int, help='seed')
@@ -899,6 +901,132 @@ def generate_user_requests(num_tasks, sequence_length):
     return user_requests
 
 
+def parse_schedule_entries(payload):
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict):
+        for key in ("requests", "schedule", "user_requests", "user_requests_with_active_tasks"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                return value
+        raise ValueError(
+            "Schedule JSON object must contain one of: "
+            "'requests', 'schedule', 'user_requests', 'user_requests_with_active_tasks'."
+        )
+    raise ValueError("Schedule JSON root must be a list or object.")
+
+
+def parse_schedule_request(entry, request_id):
+    if isinstance(entry, dict):
+        task_id = entry.get("task_id")
+        learn_type = entry.get("request_type", entry.get("learn_type", entry.get("type")))
+        active_tasks = entry.get("active_tasks")
+    elif isinstance(entry, (list, tuple)):
+        if len(entry) < 2:
+            raise ValueError(f"Schedule request {request_id} must include at least [task_id, request_type].")
+        task_id = entry[0]
+        learn_type = entry[1]
+        active_tasks = entry[2] if len(entry) >= 3 else None
+    else:
+        raise ValueError(f"Schedule request {request_id} must be an object or list.")
+
+    try:
+        task_id = int(task_id)
+    except (TypeError, ValueError):
+        raise ValueError(f"Schedule request {request_id} has invalid task_id={task_id!r}.")
+
+    learn_type = str(learn_type).strip().upper()
+    if learn_type not in {"T", "F"}:
+        raise ValueError(f"Schedule request {request_id} has invalid request type={learn_type!r}; expected 'T' or 'F'.")
+
+    parsed_active_tasks = None
+    if active_tasks is not None:
+        if not isinstance(active_tasks, list):
+            raise ValueError(f"Schedule request {request_id} has non-list active_tasks={active_tasks!r}.")
+        parsed_active_tasks = []
+        for idx, task in enumerate(active_tasks):
+            try:
+                parsed_active_tasks.append(int(task))
+            except (TypeError, ValueError):
+                raise ValueError(
+                    f"Schedule request {request_id} has invalid active_tasks[{idx}]={task!r}; expected int task IDs."
+                )
+
+    return task_id, learn_type, parsed_active_tasks
+
+
+def build_requests_with_active_tasks(user_requests, n_tasks):
+    learned_tasks = set()
+    active_tasks = []
+    user_requests_with_active_tasks = []
+    normalized_schedule = []
+
+    for request_id, entry in enumerate(user_requests):
+        task_id, learn_type, provided_active_tasks = parse_schedule_request(entry, request_id)
+
+        if not (0 <= task_id < n_tasks):
+            raise ValueError(
+                f"Schedule request {request_id} has task_id={task_id} out of range [0, {n_tasks - 1}]."
+            )
+
+        if learn_type == "T":
+            if task_id in learned_tasks:
+                raise ValueError(
+                    f"Schedule request {request_id} tries to learn task {task_id} more than once."
+                )
+            learned_tasks.add(task_id)
+            active_tasks.append(task_id)
+        else:
+            if task_id not in learned_tasks:
+                raise ValueError(
+                    f"Schedule request {request_id} tries to forget task {task_id} before learning it."
+                )
+            if task_id not in active_tasks:
+                raise ValueError(
+                    f"Schedule request {request_id} tries to forget task {task_id} which is already forgotten."
+                )
+            active_tasks.remove(task_id)
+
+        computed_active = list(active_tasks)
+        if provided_active_tasks is not None and provided_active_tasks != computed_active:
+            raise ValueError(
+                f"Schedule request {request_id} has inconsistent active_tasks={provided_active_tasks}; "
+                f"expected {computed_active}."
+            )
+
+        user_requests_with_active_tasks.append((task_id, learn_type, computed_active))
+        normalized_schedule.append(
+            {
+                "task_id": task_id,
+                "request_type": learn_type,
+                "active_tasks": computed_active,
+            }
+        )
+
+    return user_requests_with_active_tasks, normalized_schedule
+
+
+def load_request_schedule(schedule_file, n_tasks):
+    path = Path(schedule_file).expanduser()
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except OSError as exc:
+        raise ValueError(f"Failed to read request schedule file {path}: {exc}")
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Failed to parse request schedule JSON {path}: {exc}")
+
+    entries = parse_schedule_entries(payload)
+    user_requests_with_active_tasks, normalized_schedule = build_requests_with_active_tasks(entries, n_tasks)
+    return {
+        "source": "file",
+        "request_schedule_file": str(path.resolve()),
+        "loaded_request_schedule": payload,
+        "request_schedule": normalized_schedule,
+        "requests_with_active_tasks": user_requests_with_active_tasks,
+    }
+
+
 def get_request_datasets():
     def clear_all_forget_requests(li):
         to_be_removed = []
@@ -920,15 +1048,23 @@ def get_request_datasets():
     # Loading the datasets
     train_datasets, test_datasets = get_task_datasets(args)
 
-    user_requests = generate_user_requests(num_tasks=args.n_tasks, sequence_length=int(args.n_tasks + args.n_forget))
+    if args.request_schedule_file:
+        schedule_info = load_request_schedule(args.request_schedule_file, args.n_tasks)
+        user_requests_with_active_tasks = schedule_info["requests_with_active_tasks"]
+    else:
+        user_requests = generate_user_requests(num_tasks=args.n_tasks, sequence_length=int(args.n_tasks + args.n_forget))
+        user_requests_with_active_tasks, normalized_schedule = build_requests_with_active_tasks(
+            user_requests,
+            args.n_tasks,
+        )
+        schedule_info = {
+            "source": "generated",
+            "request_schedule_file": None,
+            "loaded_request_schedule": None,
+            "request_schedule": normalized_schedule,
+            "requests_with_active_tasks": user_requests_with_active_tasks,
+        }
 
-    user_requests_with_active_tasks, active_tasks = [], []
-    for task_id, learn_type in user_requests:
-        if learn_type == "T" and (task_id not in active_tasks):
-            active_tasks.append(task_id)
-        elif learn_type == "F":
-            active_tasks.remove(task_id)
-        user_requests_with_active_tasks.append((task_id, learn_type, list(active_tasks)))
     print('user_requests_with_active_tasks: ', user_requests_with_active_tasks)
 
     user_requests_without_forgotten = []
@@ -938,7 +1074,13 @@ def get_request_datasets():
             user_requests_without_forgotten.append(clear_all_forget_requests(list_up_to))
     print('user_requests_without_forgotten: ', user_requests_without_forgotten)
 
-    return train_datasets, test_datasets, user_requests_with_active_tasks, user_requests_without_forgotten
+    return (
+        train_datasets,
+        test_datasets,
+        user_requests_with_active_tasks,
+        user_requests_without_forgotten,
+        schedule_info,
+    )
 
 
 def main():
@@ -949,6 +1091,10 @@ def main():
     args.run_dir = str(run_dir)
     logger = init_logger(run_dir)
     config = serialize_config(args, run_dir, timestamp)
+    config["request_schedule_source"] = None
+    config["request_schedule_file"] = args.request_schedule_file
+    config["request_schedule"] = None
+    config["loaded_request_schedule"] = None
     write_json(run_dir / "config.json", config)
 
     methods_dict = {
@@ -981,8 +1127,27 @@ def main():
     log_event(logger, f"          run_dir:      {run_dir}")
     log_event(logger, "============================================================")
 
-    train_datasets, test_datasets, user_requests_with_active_tasks, user_requests_without_forgotten = get_request_datasets()
+    (
+        train_datasets,
+        test_datasets,
+        user_requests_with_active_tasks,
+        user_requests_without_forgotten,
+        schedule_info,
+    ) = get_request_datasets()
     log_event(logger, "[INFO] finish processing data")
+    log_event(
+        logger,
+        "[INFO] request schedule source: {source} file: {path}".format(
+            source=schedule_info.get("source"),
+            path=schedule_info.get("request_schedule_file") or "NA",
+        ),
+    )
+
+    config["request_schedule_source"] = schedule_info.get("source")
+    config["request_schedule_file"] = schedule_info.get("request_schedule_file")
+    config["request_schedule"] = schedule_info.get("request_schedule")
+    config["loaded_request_schedule"] = schedule_info.get("loaded_request_schedule")
+    write_json(run_dir / "config.json", config)
 
     metrics_state = {
         "run": {
@@ -993,11 +1158,17 @@ def main():
             "deterministic": args.deterministic,
             "n_tasks": args.n_tasks,
             "n_forget": args.n_forget,
+            "request_schedule_source": schedule_info.get("source"),
+            "request_schedule_file": schedule_info.get("request_schedule_file"),
             "timestamp": timestamp,
             "run_dir": str(run_dir),
         },
         "unlearning_events": [],
         "sanity_checks": [],
+        "request_schedule_source": schedule_info.get("source"),
+        "request_schedule_file": schedule_info.get("request_schedule_file"),
+        "request_schedule": schedule_info.get("request_schedule"),
+        "loaded_request_schedule": schedule_info.get("loaded_request_schedule"),
         "requests": user_requests_with_active_tasks,
         "requests_without_forgotten": user_requests_without_forgotten,
         "normalized_results": {
