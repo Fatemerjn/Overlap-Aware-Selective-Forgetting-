@@ -83,7 +83,7 @@ class PALL(Base):
         return features.cpu(), logits.cpu(), targets.cpu()
 
     def fill_buffer(self, task_id, dataset):
-        sel_loader = DataLoader(dataset, batch_size=self.args.batch_size, shuffle=False, num_workers=2)
+        sel_loader = self.build_dataloader(dataset, shuffle=False, context=f"fill_buffer_task_{task_id}")
         features, logits, targets = self.extract_logits_and_features(sel_loader, task_id)
         if self.args.mem_type == "random":
             sel_indices = self.memory.select_indices_by_random(targets)
@@ -99,13 +99,17 @@ class PALL(Base):
         assert task_id not in self.per_task_masks, f"[ERROR] {task_id} already present in learned subnet masks"
         assert self.args.weight_decay >= 0.0, f"[ERROR] Invalid weight_decay value: {self.args.weight_decay}"
 
-        loader = DataLoader(dataset, batch_size=self.args.batch_size, shuffle=True, num_workers=2)
+        loader = self.build_dataloader(dataset, shuffle=True, context=f"learn_task_{task_id}")
         self.opt = self.init_optimizer()
+        train_start = time.perf_counter()
+        self.log_progress(f"task training start: task={task_id} epochs={self.args.n_epochs} steps_per_epoch={len(loader)}")
 
         if isinstance(self.net, SubnetVisionTransformer) or isinstance(self.net, VisionTransformer):
             self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.opt, self.args.n_epochs)
 
         for epoch in range(self.args.n_epochs):
+            epoch_start = time.perf_counter()
+            self.log_epoch_start(task_id, epoch, self.args.n_epochs)
             for i, (x, y) in enumerate(loader):
                 x, y = x.to(self.device), y.to(self.device)
                 loss = self.loss_fn(self.forward(x, task_id, mask=None, mode="train"), y)
@@ -150,6 +154,7 @@ class PALL(Base):
 
             if self.scheduler is not None:
                 self.scheduler.step()
+            self.log_epoch_end(task_id, epoch, self.args.n_epochs, epoch_start)
 
         # Then save the per-task-dependent masks
         self.per_task_masks[task_id] = self.net.get_masks(task_id)
@@ -174,6 +179,9 @@ class PALL(Base):
         # Reinitialize the scores and unused weights
         self.net.reinit_scores()
         self.net.reinit_weights(self.combined_masks)
+        self.log_progress(
+            f"task training end: task={task_id} elapsed={self._format_elapsed(self._elapsed_since(train_start))}"
+        )
 
     def _backup_shared_weights(self, shared_masks, removed_task_id):
         if not self.per_task_masks:
@@ -356,6 +364,8 @@ class PALL(Base):
 
     def _forget_impl(self, task_id, eval_fn=None, debug_context=None, remaining_tasks=None, return_info=False):
         assert task_id in self.per_task_masks, f"[ERROR] {task_id} is not learned yet (no per_task_mask found)"
+        forget_start = time.perf_counter()
+        self.log_progress(f"forget phase start: task={task_id}")
 
         info = {
             "t_reset": 0.0,
@@ -536,8 +546,12 @@ class PALL(Base):
 
             # (6) Reinitialize the weights that were specific to this task
             t_reset_start = time.perf_counter()
+            self.log_progress(f"reset phase start: task={task_id}")
             self.net.reinit_weights(to_reset)
             info["t_reset"] = time.perf_counter() - t_reset_start
+            self.log_progress(
+                f"reset phase end: task={task_id} elapsed={self._format_elapsed(info['t_reset'])}"
+            )
 
             if eval_fn is not None:
                 info["after_reset_eval"] = eval_fn("after_reset")
@@ -641,6 +655,9 @@ class PALL(Base):
                 }
 
                 t_retrain_start = time.perf_counter()
+                self.log_progress(
+                    f"retrain phase start: task={task_id} steps={retrain_steps} active_tasks={active_tasks}"
+                )
                 for _ in range(retrain_steps):
                     finetune_opt.zero_grad()
                     loss = 0.0
@@ -692,6 +709,9 @@ class PALL(Base):
 
                     finetune_opt.step()
                 info["t_retrain"] = time.perf_counter() - t_retrain_start
+                self.log_progress(
+                    f"retrain phase end: task={task_id} elapsed={self._format_elapsed(info['t_retrain'])}"
+                )
             else:
                 info["protection"] = {
                     "active": use_protection,
@@ -702,6 +722,7 @@ class PALL(Base):
                     "retrain_steps": 0,
                     "adaptive_retrain": self.args.adaptive_retrain,
                 }
+                self.log_progress(f"retrain phase skipped: task={task_id} updated_params=0")
 
             if debug_context is not None:
                 after_retrain_norms = {
@@ -757,8 +778,12 @@ class PALL(Base):
                 }
             self.combined_masks = {}
             t_reset_start = time.perf_counter()
+            self.log_progress(f"reset phase start: task={task_id}")
             self.net.reinit_weights(self.combined_masks)
             info["t_reset"] = time.perf_counter() - t_reset_start
+            self.log_progress(
+                f"reset phase end: task={task_id} elapsed={self._format_elapsed(info['t_reset'])}"
+            )
             if eval_fn is not None:
                 info["after_reset_eval"] = eval_fn("after_reset")
             if debug_context is not None:
@@ -791,6 +816,9 @@ class PALL(Base):
             }
             self._dump_unlearning_debug(debug_path, debug_masks, indices, norms, diff_norms)
 
+        self.log_progress(
+            f"forget phase end: task={task_id} elapsed={self._format_elapsed(self._elapsed_since(forget_start))}"
+        )
         return info if return_info else None
 
     def compute_overlap_matrix(self, include_forgotten=True):

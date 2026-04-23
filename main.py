@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import random
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
@@ -38,6 +39,9 @@ parser.add_argument('--lr', default=0.01, type=float, help='learning rate')
 parser.add_argument('--weight_decay', default=5e-4, type=float, help='weight_decay')
 parser.add_argument('--momentum', default=0.9, type=float, help='momentum')
 parser.add_argument('--batch_size', default=32, type=int, help='batch size')
+parser.add_argument('--num_workers', default=None, type=int, help='DataLoader workers; defaults to 0 on macOS, 2 elsewhere')
+parser.add_argument('--pin_memory', dest='pin_memory', action='store_true', help='enable DataLoader pin_memory')
+parser.add_argument('--no-pin-memory', dest='pin_memory', action='store_false', help='disable DataLoader pin_memory')
 
 parser.add_argument(
     '--method',
@@ -82,6 +86,7 @@ parser.add_argument('--allow_zero_retrain', default=False, action='store_true',
 parser.add_argument('--adaptive_retrain', default=False, action='store_true', help='adapt retrain steps to overlap')
 parser.add_argument('--debug_unlearning', default=False, action='store_true', help='dump unlearning artifacts')
 parser.add_argument('--dump_overlap', default=False, action='store_true', help='dump overlap matrix CSV')
+parser.set_defaults(pin_memory=None)
 args = parser.parse_args()
 
 PALL_METHODS = {"pall", "pall_original", "pall_modified"}
@@ -104,6 +109,8 @@ def validate_experiment_args(arg_namespace):
             parser.error("CIFAR-100 superclass tasks require --class_per_task 5.")
         if not (1 <= arg_namespace.n_tasks <= 20):
             parser.error("CIFAR-100 superclass tasks require --n_tasks in [1, 20].")
+    if arg_namespace.num_workers is not None and arg_namespace.num_workers < 0:
+        parser.error("--num_workers must be >= 0.")
 
 
 def set_seed(seed, deterministic=False):
@@ -217,7 +224,27 @@ def resolve_device(arg_namespace):
     return torch.device("cpu")
 
 
+def resolve_num_workers(arg_namespace):
+    if arg_namespace.num_workers is not None:
+        return int(arg_namespace.num_workers)
+    if sys.platform == "darwin":
+        return 0
+    return 2
+
+
+def resolve_pin_memory(arg_namespace):
+    if arg_namespace.pin_memory is not None:
+        return bool(arg_namespace.pin_memory)
+    if sys.platform == "darwin":
+        return False
+    return arg_namespace.device.type == "cuda"
+
+
 args.device = resolve_device(args)
+args.is_macos = sys.platform == "darwin"
+args.resolved_num_workers = resolve_num_workers(args)
+args.resolved_pin_memory = resolve_pin_memory(args)
+args.resolved_persistent_workers = False if args.resolved_num_workers > 0 else False
 args.arch = 'subnet_' + args.arch.lower() if args.method in PALL_METHODS else args.arch.lower()
 args.dim_input = (3, 64, 64) if args.dataset == "tinyimagenet" else (3, 32, 32)
 
@@ -230,7 +257,10 @@ def evaluate(test_datasets, args, model, return_logits=True, verbose=True):
     with torch.no_grad():
         for task, dataset in enumerate(test_datasets):
             bsize = args.batch_size
-            loader = DataLoader(dataset, batch_size=bsize, shuffle=False)
+            if hasattr(model, "build_dataloader"):
+                loader = model.build_dataloader(dataset, batch_size=bsize, shuffle=False, context=f"eval_task_{task}")
+            else:
+                loader = DataLoader(dataset, batch_size=bsize, shuffle=False)
             l = a = n = 0.0
             logit_ = torch.zeros(len(dataset), cpt) if return_logits else None
             for i, (x, y) in enumerate(loader):
@@ -446,6 +476,8 @@ def process_requests(args, model, train_datasets, test_datasets, requests, run_c
             pre_acc = to_list(pre_eval["accuracy"])
             remaining_tasks = list(active_tasks)
             avg_before = avg_for_tasks(pre_acc, remaining_tasks)
+            forget_phase_start = time.perf_counter()
+            log_event(logger, f"[INFO] forgetting start: task={task_id} remaining_tasks={remaining_tasks}")
 
             def eval_callback(stage):
                 return evaluate(test_datasets, args, model, return_logits=False, verbose=False)
@@ -478,6 +510,10 @@ def process_requests(args, model, train_datasets, test_datasets, requests, run_c
                     "t_forget_total": t1 - t0,
                     "num_updated_params": None,
                 }
+            log_event(
+                logger,
+                f"[INFO] forgetting end: task={task_id} elapsed={time.perf_counter() - forget_phase_start:.2f}s",
+            )
 
             after_reset_eval = info.get("after_reset_eval")
             after_reset_acc = to_list(after_reset_eval["accuracy"]) if after_reset_eval else pre_acc
@@ -603,8 +639,10 @@ def process_requests(args, model, train_datasets, test_datasets, requests, run_c
             times[request_id] = float(t_forget_total)
         else:
             t0 = time.perf_counter()
+            log_event(logger, f"[INFO] task training start: task={task_id}")
             model.privacy_aware_lifelong_learning(task_id, train_datasets[task_id], learn_type)
             t1 = time.perf_counter()
+            log_event(logger, f"[INFO] task training end: task={task_id} elapsed={t1 - t0:.2f}s")
             stat = evaluate(test_datasets, args, model, return_logits=True, verbose=True)
             times[request_id] = t1 - t0
 
@@ -1095,6 +1133,7 @@ def get_request_datasets():
 
 def main():
     global args
+    run_start = time.perf_counter()
     set_seed(args.seed, args.deterministic)
 
     run_dir, timestamp = init_run_dir(args)
@@ -1133,10 +1172,24 @@ def main():
     log_event(logger, f"          architecture: {args.arch}")
     log_event(logger, f"          norm params:  {args.norm_params}")
     log_event(logger, f"          device:       {args.device}")
+    log_event(logger, f"          host_os:      {'macOS' if args.is_macos else sys.platform}")
+    log_event(
+        logger,
+        "          dataloader:   num_workers={num_workers} pin_memory={pin_memory} persistent_workers={persistent}".format(
+            num_workers=args.resolved_num_workers,
+            pin_memory=args.resolved_pin_memory,
+            persistent=args.resolved_persistent_workers,
+        ),
+    )
+    log_event(
+        logger,
+        f"          placement:    batches move in-loop via x.to({args.device}), y.to({args.device})",
+    )
     log_event(logger, f"          deterministic:{args.deterministic}")
     log_event(logger, f"          run_dir:      {run_dir}")
     log_event(logger, "============================================================")
 
+    data_start = time.perf_counter()
     (
         train_datasets,
         test_datasets,
@@ -1144,7 +1197,7 @@ def main():
         user_requests_without_forgotten,
         schedule_info,
     ) = get_request_datasets()
-    log_event(logger, "[INFO] finish processing data")
+    log_event(logger, f"[INFO] finish processing data in {time.perf_counter() - data_start:.2f}s")
     log_event(
         logger,
         "[INFO] request schedule source: {source} file: {path}".format(
@@ -1207,9 +1260,12 @@ def main():
     }
 
     log_event(logger, f"[INFO] processing user requests: {user_requests_with_active_tasks}")
+    model_start = time.perf_counter()
     model = methods_dict[args.method](args).to(args.device)
     init_model = model.state_dict()
     model.load_state_dict(init_model)
+    log_event(logger, f"[INFO] model initialized on {args.device} in {time.perf_counter() - model_start:.2f}s")
+    request_start = time.perf_counter()
     current_stat = process_requests(
         args,
         model,
@@ -1218,6 +1274,7 @@ def main():
         user_requests_with_active_tasks,
         run_context,
     )
+    log_event(logger, f"[INFO] finished processing requests in {time.perf_counter() - request_start:.2f}s")
     forgetting_stats = compute_average_forgetting(
         current_stat["accuracy"],
         user_requests_with_active_tasks,
@@ -1315,6 +1372,7 @@ def main():
         log_event(logger, f"[INFO] wrote run report to {run_dir / 'report.md'}")
     except Exception as exc:
         log_event(logger, f"[WARN] failed to write run report: {exc}")
+    log_event(logger, f"[INFO] total run time: {time.perf_counter() - run_start:.2f}s")
 
 
 if __name__ == "__main__":

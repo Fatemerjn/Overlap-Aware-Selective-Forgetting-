@@ -57,13 +57,17 @@ class CLPU(Base):
 
         self.side_nets[task_id] = models.__dict__[self.args.arch.lower()](self.cpt * self.n_tasks).to(self.args.device)
 
-        loader = DataLoader(dataset, batch_size=self.args.batch_size, shuffle=True, num_workers=2)
+        loader = self.build_dataloader(dataset, shuffle=True, context=f"learn_task_{task_id}")
         opt = self.init_optimizer_per_task(task_id)
+        train_start = time.perf_counter()
+        self.log_progress(f"task training start: task={task_id} epochs={self.args.n_epochs} steps_per_epoch={len(loader)}")
 
         if isinstance(self.net, SubnetVisionTransformer) or isinstance(self.net, VisionTransformer):
             self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, self.args.n_epochs)
 
         for epoch in range(self.args.n_epochs):
+            epoch_start = time.perf_counter()
+            self.log_epoch_start(task_id, epoch, self.args.n_epochs)
             for i, (x, y) in enumerate(loader):
                 x, y = x.to(self.device), y.to(self.device)
                 h = self.forward(x, task_id)
@@ -74,6 +78,10 @@ class CLPU(Base):
 
             if self.scheduler is not None:
                 self.scheduler.step()
+            self.log_epoch_end(task_id, epoch, self.args.n_epochs, epoch_start)
+        self.log_progress(
+            f"task training end: task={task_id} elapsed={self._format_elapsed(self._elapsed_since(train_start))}"
+        )
 
     def forget(self, task_id):
         del self.side_nets[task_id]

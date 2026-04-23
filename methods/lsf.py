@@ -42,14 +42,18 @@ class LSF(Base):
         for p in self.old_net.parameters():
             p.requires_grad = False
 
-        loader = DataLoader(dataset, batch_size=self.args.batch_size, shuffle=True, num_workers=2)
+        loader = self.build_dataloader(dataset, shuffle=True, context=f"learn_task_{task_id}")
         self.opt = self.init_optimizer()
+        train_start = time.perf_counter()
+        self.log_progress(f"task training start: task={task_id} epochs={self.args.n_epochs} steps_per_epoch={len(loader)}")
 
         if len(self.prev_tasks) > 0:
             self.opt_cls = self.init_optimizer_classifier()
             if isinstance(self.net, SubnetVisionTransformer) or isinstance(self.net, VisionTransformer):
                 self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.opt_cls, self.args.n_epochs)
             for epoch in range(self.args.n_epochs):
+                epoch_start = time.perf_counter()
+                self.log_epoch_start(task_id, epoch, self.args.n_epochs, phase="classifier_warmup")
                 for i, (x, y) in enumerate(loader):
                     x, y = x.to(self.device), y.to(self.device)
                     loss = self.loss_fn(self.forward(x, task_id), y)
@@ -58,6 +62,7 @@ class LSF(Base):
                     self.opt_cls.step()
                 if self.scheduler is not None:
                     self.scheduler.step()
+                self.log_epoch_end(task_id, epoch, self.args.n_epochs, epoch_start, phase="classifier_warmup")
 
         lsf_gamma = self.args.lsf_gamma
         ewc_lmbd = self.args.ewc_lmbd
@@ -68,6 +73,8 @@ class LSF(Base):
             self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.opt, self.args.n_epochs)
 
         for epoch in range(self.args.n_epochs):
+            epoch_start = time.perf_counter()
+            self.log_epoch_start(task_id, epoch, self.args.n_epochs)
             for i, (x, y) in enumerate(loader):
                 x, y = x.to(self.device), y.to(self.device)
 
@@ -103,7 +110,10 @@ class LSF(Base):
 
             if self.scheduler is not None:
                 self.scheduler.step()
+            self.log_epoch_end(task_id, epoch, self.args.n_epochs, epoch_start)
 
+        fish_start = time.perf_counter()
+        self.log_progress(f"fisher estimation start: task={task_id}")
         fish = torch.zeros_like(self.net.get_params())
         for j, (x, y) in enumerate(loader):
             x, y = x.to(self.device), y.to(self.device)
@@ -120,6 +130,12 @@ class LSF(Base):
         self.prev_tasks.append(task_id)
         self.fish[task_id] = fish
         self.checkpoint[task_id] = self.net.get_params().data.clone()
+        self.log_progress(
+            f"fisher estimation end: task={task_id} elapsed={self._format_elapsed(self._elapsed_since(fish_start))}"
+        )
+        self.log_progress(
+            f"task training end: task={task_id} elapsed={self._format_elapsed(self._elapsed_since(train_start))}"
+        )
 
     def forget(self, task_id):
         self.prev_tasks.remove(task_id)
@@ -130,6 +146,8 @@ class LSF(Base):
         self.opt = self.init_optimizer()
 
         assert self.args.forget_iters is not None
+        forget_start = time.perf_counter()
+        self.log_progress(f"forget phase start: task={task_id} iterations={self.args.forget_iters}")
 
         if self.args.forget_iters:
             for i in range(self.args.forget_iters):
@@ -152,3 +170,6 @@ class LSF(Base):
 
                 loss.backward()
                 self.opt.step()
+        self.log_progress(
+            f"forget phase end: task={task_id} elapsed={self._format_elapsed(self._elapsed_since(forget_start))}"
+        )
