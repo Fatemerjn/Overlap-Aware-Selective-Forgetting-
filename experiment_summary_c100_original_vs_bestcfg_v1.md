@@ -11,18 +11,18 @@
 | n_tasks | 10 |
 | n_forget | 3 |
 | seed | 0, 1 |
-| num_runs | 4 |
+| num_runs | 8 |
 
 ## Key Metrics
 | Method | Dataset | Seeds | Runs | Final Avg Acc | Avg Forgetting | Fu | WorstDrop | Au | Retrain Time |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| pall_modified | cifar100 | 0, 1 | 2 | 3.0000 +/- 0.0000 | 0.2000 +/- 0.0000 | 0.1000 +/- 0.0000 | 50.0000 +/- 0.0000 | NA | 0.0859 +/- 0.0004 |
-| pall_original | cifar100 | 0, 1 | 2 | 0.4124 +/- 0.0143 | 0.1485 +/- 0.0191 | 0.0331 +/- 0.0057 | 0.0770 +/- 0.0127 | 0.2000 +/- 0.0000 | 0.1758 +/- 0.0001 |
+| pall_modified | cifar100 | 0, 1 | 4 | 0.5456 +/- 0.0153 | 0.0859 +/- 0.0003 | -0.0063 +/- 0.0026 | 0.0140 +/- 0.0069 | 0.1990 +/- 0.0012 | 12.0668 +/- 0.4863 |
+| pall_original | cifar100 | 0, 1 | 4 | 0.4124 +/- 0.0117 | 0.1485 +/- 0.0156 | 0.0331 +/- 0.0046 | 0.0770 +/- 0.0104 | 0.2000 +/- 0.0000 | 0.1758 +/- 0.0001 |
 
 ## Automatic Observations
-- cifar100: Final Avg Acc: pall_modified is better than pall_original (mean delta 2.5876).
-- cifar100: Fu: pall_modified is worse than pall_original (mean delta 0.0669).
-- cifar100: WorstDrop: pall_modified is worse than pall_original (mean delta 49.9230).
-- cifar100: Retrain Time: pall_modified is better than pall_original (mean delta -0.0899).
+- cifar100: Final Avg Acc: pall_modified is better than pall_original (mean delta 0.1331).
+- cifar100: Fu: pall_modified is better than pall_original (mean delta -0.0394).
+- cifar100: WorstDrop: pall_modified is better than pall_original (mean delta -0.0630).
+- cifar100: Retrain Time: pall_modified is worse than pall_original (mean delta 11.8910).
 - These observations compare descriptive means only and do not imply statistical significance.
 - Differences with absolute delta <= 0.0010 are reported as similar.
