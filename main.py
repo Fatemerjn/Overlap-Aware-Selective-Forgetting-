@@ -57,6 +57,7 @@ parser.add_argument(
         'pall',
         'pall_original',
         'pall_modified',
+        'pall_adapter',
     ],
     help='method for CL with unlearning',
 )
@@ -86,10 +87,24 @@ parser.add_argument('--allow_zero_retrain', default=False, action='store_true',
 parser.add_argument('--adaptive_retrain', default=False, action='store_true', help='adapt retrain steps to overlap')
 parser.add_argument('--debug_unlearning', default=False, action='store_true', help='dump unlearning artifacts')
 parser.add_argument('--dump_overlap', default=False, action='store_true', help='dump overlap matrix CSV')
+parser.add_argument('--adapter_bottleneck', default=16, type=int, help='adapter bottleneck size for pall_adapter')
+parser.add_argument(
+    '--adapter_train_classifier',
+    default=False,
+    action='store_true',
+    help='allow classifier/head training for pall_adapter',
+)
+parser.add_argument(
+    '--adapter_location',
+    default='residual',
+    choices=['residual'],
+    help='adapter insertion location for pall_adapter',
+)
 parser.set_defaults(pin_memory=None)
 args = parser.parse_args()
 
 PALL_METHODS = {"pall", "pall_original", "pall_modified"}
+ADAPTER_METHODS = {"pall_adapter"}
 
 
 def normalize_method(arg_namespace):
@@ -99,6 +114,8 @@ def normalize_method(arg_namespace):
         arg_namespace.method_variant = "modified"
     elif arg_namespace.method == "pall_original":
         arg_namespace.method_variant = "original"
+    elif arg_namespace.method == "pall_adapter":
+        arg_namespace.method_variant = "adapter"
     else:
         arg_namespace.method_variant = None
 
@@ -111,6 +128,8 @@ def validate_experiment_args(arg_namespace):
             parser.error("CIFAR-100 superclass tasks require --n_tasks in [1, 20].")
     if arg_namespace.num_workers is not None and arg_namespace.num_workers < 0:
         parser.error("--num_workers must be >= 0.")
+    if arg_namespace.method == "pall_adapter" and arg_namespace.adapter_bottleneck <= 0:
+        parser.error("--adapter_bottleneck must be > 0 for pall_adapter.")
 
 
 def set_seed(seed, deterministic=False):
@@ -193,6 +212,23 @@ def serialize_config(arg_namespace, run_dir, timestamp):
     return config
 
 
+def extract_model_param_stats(model):
+    stats = getattr(model, "param_stats", None)
+    if stats is not None:
+        return json_safe(stats)
+    net = getattr(model, "net", None)
+    if net is None:
+        return None
+    total_params = sum(param.numel() for param in net.parameters())
+    trainable_params = sum(param.numel() for param in net.parameters() if param.requires_grad)
+    return {
+        "total_params": int(total_params),
+        "num_trainable_params": int(trainable_params),
+        "num_adapter_params": 0,
+        "trainable_param_ratio": float(trainable_params / total_params) if total_params else 0.0,
+    }
+
+
 normalize_method(args)
 validate_experiment_args(args)
 
@@ -245,7 +281,12 @@ args.is_macos = sys.platform == "darwin"
 args.resolved_num_workers = resolve_num_workers(args)
 args.resolved_pin_memory = resolve_pin_memory(args)
 args.resolved_persistent_workers = False if args.resolved_num_workers > 0 else False
-args.arch = 'subnet_' + args.arch.lower() if args.method in PALL_METHODS else args.arch.lower()
+if args.method in PALL_METHODS:
+    args.arch = 'subnet_' + args.arch.lower()
+elif args.method in ADAPTER_METHODS:
+    args.arch = 'adapter_' + args.arch.lower()
+else:
+    args.arch = args.arch.lower()
 args.dim_input = (3, 64, 64) if args.dataset == "tinyimagenet" else (3, 32, 32)
 
 
@@ -688,6 +729,14 @@ def write_summary(path, summary, normalized_results):
         f"method: {summary['method']} ({summary['method_variant']})",
         f"seed: {summary['seed']} (deterministic={summary['deterministic']})",
         f"tasks: {summary['n_tasks']} | forget_requests: {summary['n_forget']}",
+        (
+            "model_params: total {total} trainable {trainable} adapter {adapter} trainable_ratio {ratio}".format(
+                total=format_optional_int(summary.get("total_params")),
+                trainable=format_optional_int(summary.get("num_trainable_params")),
+                adapter=format_optional_int(summary.get("num_adapter_params")),
+                ratio=format_optional_float(summary.get("trainable_param_ratio")),
+            )
+        ),
         f"final_avg_accuracy: {summary['final_avg_accuracy']:.4f}",
         f"final_avg_forgetting: {summary['final_avg_forgetting']:.4f}",
         (
@@ -796,6 +845,7 @@ def write_run_report(path, run_dir, config, metrics_state):
     normalized_final = normalized_results.get("final", {}) if isinstance(normalized_results, dict) else {}
     summary = metrics_state.get("summary", {})
     forgetting = metrics_state.get("forgetting", {})
+    model_stats = metrics_state.get("model", {}) if isinstance(metrics_state.get("model"), dict) else {}
 
     final_avg_acc = first_non_none(
         normalized_final.get("final_avg_accuracy"),
@@ -854,6 +904,14 @@ def write_run_report(path, run_dir, config, metrics_state):
         ("lr", config.get("lr")),
         ("deterministic", config.get("deterministic")),
     ]
+    if config.get("method") == "pall_adapter":
+        config_rows.extend(
+            [
+                ("adapter_bottleneck", config.get("adapter_bottleneck")),
+                ("adapter_location", config.get("adapter_location")),
+                ("adapter_train_classifier", config.get("adapter_train_classifier")),
+            ]
+        )
 
     lines = [
         "# Run Report",
@@ -867,6 +925,14 @@ def write_run_report(path, run_dir, config, metrics_state):
 
     lines.extend(
         [
+            "",
+            "## Model Parameter Metrics",
+            "| Metric | Value |",
+            "| --- | --- |",
+            f"| total_params | {format_optional_int(model_stats.get('total_params'))} |",
+            f"| num_trainable_params | {format_optional_int(model_stats.get('num_trainable_params'))} |",
+            f"| num_adapter_params | {format_optional_int(model_stats.get('num_adapter_params'))} |",
+            f"| trainable_param_ratio | {format_optional_float(model_stats.get('trainable_param_ratio'))} |",
             "",
             "## Final Metrics",
             "| Metric | Value |",
@@ -1157,6 +1223,7 @@ def main():
         "pall": PALL,
         "pall_original": PALL,
         "pall_modified": PALL,
+        "pall_adapter": PALLAdapter,
     }
 
     log_event(logger, "============================================================")
@@ -1264,6 +1331,19 @@ def main():
     model = methods_dict[args.method](args).to(args.device)
     init_model = model.state_dict()
     model.load_state_dict(init_model)
+    model_stats = extract_model_param_stats(model)
+    if model_stats is not None:
+        metrics_state["model"] = model_stats
+        write_json(metrics_path, metrics_state)
+        log_event(
+            logger,
+            "[INFO] model params: total={total} trainable={trainable} adapter={adapter} ratio={ratio}".format(
+                total=format_optional_int(model_stats.get("total_params")),
+                trainable=format_optional_int(model_stats.get("num_trainable_params")),
+                adapter=format_optional_int(model_stats.get("num_adapter_params")),
+                ratio=format_optional_float(model_stats.get("trainable_param_ratio")),
+            ),
+        )
     log_event(logger, f"[INFO] model initialized on {args.device} in {time.perf_counter() - model_start:.2f}s")
     request_start = time.perf_counter()
     current_stat = process_requests(
@@ -1325,6 +1405,12 @@ def main():
         "final_avg_accuracy": final_avg,
         "final_avg_forgetting": forgetting_stats["final"],
     }
+    model_stats = metrics_state.get("model", {})
+    if isinstance(model_stats, dict):
+        summary["total_params"] = model_stats.get("total_params")
+        summary["num_trainable_params"] = model_stats.get("num_trainable_params")
+        summary["num_adapter_params"] = model_stats.get("num_adapter_params")
+        summary["trainable_param_ratio"] = model_stats.get("trainable_param_ratio")
     normalized_results = metrics_state.get("normalized_results", {})
     normalized_events = normalized_results.get("unlearning_events", [])
     final_unlearning = {
