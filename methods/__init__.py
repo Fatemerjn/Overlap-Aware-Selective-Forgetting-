@@ -6,3 +6,4 @@ from .derpp import Derpp
 from .lsf import LSF
 from .clpu import CLPU
 from .pall import PALL
+from .pall_adapter import PALLAdapter

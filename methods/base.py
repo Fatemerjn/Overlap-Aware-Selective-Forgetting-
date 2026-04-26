@@ -13,10 +13,19 @@ class Base(nn.Module):
     def __init__(self, args):
         super(Base, self).__init__()
         self.args = args
-        self.net = models.__dict__[args.arch](args.class_per_task * args.n_tasks,
-                                              n_tasks=args.n_tasks,
-                                              sparsity=args.sparsity,
-                                              norm_params=args.norm_params)
+        model_kwargs = {
+            "n_tasks": args.n_tasks,
+            "sparsity": args.sparsity,
+            "norm_params": args.norm_params,
+        }
+        if str(args.arch).startswith("adapter_"):
+            model_kwargs.update(
+                {
+                    "adapter_bottleneck": args.adapter_bottleneck,
+                    "adapter_location": args.adapter_location,
+                }
+            )
+        self.net = models.__dict__[args.arch](args.class_per_task * args.n_tasks, **model_kwargs)
         self.device = args.device
         self.n_tasks = args.n_tasks
         self.cpt = args.class_per_task
