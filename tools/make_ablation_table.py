@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Dict, List, Tuple
 
 
-OUTPUT_COLUMNS = [
+BASE_OUTPUT_COLUMNS = [
     "Dataset",
     "Method",
     "Protect Ratio",
@@ -45,13 +45,35 @@ OUTPUT_COLUMNS = [
     "Retrain Time",
 ]
 
-GROUP_COLUMNS = [
+ADAPTER_OUTPUT_COLUMNS = [
+    "Dataset",
+    "Method",
+    "Adapter Bottleneck",
+    "Train Classifier",
+    "Adapter Location",
+    "Final Avg Acc",
+    "Avg Forgetting",
+    "Fu",
+    "WorstDrop",
+    "Au",
+    "Retrain Time",
+]
+
+BASE_GROUP_COLUMNS = [
     ("dataset", "Dataset"),
     ("method", "Method"),
     ("protect_ratio", "Protect Ratio"),
     ("lambda_protect", "Lambda Protect"),
     ("retrain_steps", "Retrain Steps"),
     ("n_epochs", "Epochs"),
+]
+
+ADAPTER_GROUP_COLUMNS = [
+    ("dataset", "Dataset"),
+    ("method", "Method"),
+    ("adapter_bottleneck", "Adapter Bottleneck"),
+    ("adapter_train_classifier", "Train Classifier"),
+    ("adapter_location", "Adapter Location"),
 ]
 
 METRIC_COLUMNS = [
@@ -114,7 +136,8 @@ def fmt_mean_std(values: List[float], decimals: int) -> str:
 def read_rows(path: Path):
     try:
         with path.open("r", encoding="utf-8", newline="") as handle:
-            return list(csv.DictReader(handle))
+            reader = csv.DictReader(handle)
+            return list(reader), list(reader.fieldnames or [])
     except FileNotFoundError:
         print(f"[ERROR] Input CSV not found: {path}", file=sys.stderr)
         return None
@@ -123,29 +146,34 @@ def read_rows(path: Path):
         return None
 
 
-def build_table(rows: List[Dict[str, str]], decimals: int):
+def has_adapter_ablation(rows: List[Dict[str, str]], fieldnames: List[str]) -> bool:
+    if "adapter_bottleneck" not in fieldnames:
+        return False
+    for row in rows:
+        if any(
+            normalize_group_value(row.get(column, "")) != ""
+            for column in ("adapter_bottleneck", "adapter_train_classifier", "adapter_location")
+        ):
+            return True
+    return False
+
+
+def build_table(rows: List[Dict[str, str]], decimals: int, group_columns):
     grouped: Dict[Tuple[str, ...], List[Dict[str, str]]] = {}
     for row in rows:
-        key = tuple(normalize_group_value(row.get(in_col, "")) for in_col, _ in GROUP_COLUMNS)
+        key = tuple(normalize_group_value(row.get(in_col, "")) for in_col, _ in group_columns)
         grouped.setdefault(key, []).append(row)
 
     sorted_keys = sorted(
         grouped.keys(),
-        key=lambda key: (
-            sort_group_value(key[0]),
-            sort_group_value(key[1]),
-            sort_group_value(key[2]),
-            sort_group_value(key[3]),
-            sort_group_value(key[4]),
-            sort_group_value(key[5]),
-        ),
+        key=lambda key: tuple(sort_group_value(value) for value in key),
     )
 
     table = []
     for key in sorted_keys:
         group_rows = grouped[key]
         out_row = {}
-        for idx, (_, out_col) in enumerate(GROUP_COLUMNS):
+        for idx, (_, out_col) in enumerate(group_columns):
             out_row[out_col] = key[idx]
         for in_col, out_col in METRIC_COLUMNS:
             values = []
@@ -158,22 +186,22 @@ def build_table(rows: List[Dict[str, str]], decimals: int):
     return table
 
 
-def write_csv(path: Path, rows: List[Dict[str, str]]):
+def write_csv(path: Path, rows: List[Dict[str, str]], output_columns: List[str]):
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=OUTPUT_COLUMNS)
+        writer = csv.DictWriter(handle, fieldnames=output_columns)
         writer.writeheader()
         for row in rows:
-            writer.writerow({col: row.get(col, "") for col in OUTPUT_COLUMNS})
+            writer.writerow({col: row.get(col, "") for col in output_columns})
 
 
-def write_markdown(path: Path, rows: List[Dict[str, str]]):
+def write_markdown(path: Path, rows: List[Dict[str, str]], output_columns: List[str]):
     path.parent.mkdir(parents=True, exist_ok=True)
-    header = "| " + " | ".join(OUTPUT_COLUMNS) + " |"
-    sep = "| " + " | ".join(["---"] * len(OUTPUT_COLUMNS)) + " |"
+    header = "| " + " | ".join(output_columns) + " |"
+    sep = "| " + " | ".join(["---"] * len(output_columns)) + " |"
     lines = [header, sep]
     for row in rows:
-        line = "| " + " | ".join(str(row.get(col, "")) for col in OUTPUT_COLUMNS) + " |"
+        line = "| " + " | ".join(str(row.get(col, "")) for col in output_columns) + " |"
         lines.append(line)
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -199,13 +227,18 @@ def parse_args():
 
 def main():
     args = parse_args()
-    rows = read_rows(args.input_csv)
-    if rows is None:
+    loaded = read_rows(args.input_csv)
+    if loaded is None:
         return 1
+    rows, fieldnames = loaded
 
-    table = build_table(rows, args.decimals)
-    write_csv(args.out_csv, table)
-    write_markdown(args.out_md, table)
+    use_adapter_schema = has_adapter_ablation(rows, fieldnames)
+    group_columns = ADAPTER_GROUP_COLUMNS if use_adapter_schema else BASE_GROUP_COLUMNS
+    output_columns = ADAPTER_OUTPUT_COLUMNS if use_adapter_schema else BASE_OUTPUT_COLUMNS
+
+    table = build_table(rows, args.decimals, group_columns)
+    write_csv(args.out_csv, table, output_columns)
+    write_markdown(args.out_md, table, output_columns)
 
     print(f"[INFO] Wrote CSV ablation table: {args.out_csv}")
     print(f"[INFO] Wrote Markdown ablation table: {args.out_md}")
